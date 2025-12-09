@@ -1,0 +1,514 @@
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+import os
+import csv
+import asyncio
+import html
+import io
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo  
+
+
+TOKEN = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" #write ur api key 
+CSV_EVENTS = "presence_events.csv"
+CSV_SESSIONS = "presence_sessions.csv"
+ADMIN_ROLE_NAME = "Presence-Admin"
+DAILY_REPORT_CHANNEL_ID = None
+DAILY_REPORT_HOUR_UTC = 7
+RETENTION_DAYS = 90
+
+
+intents = discord.Intents.default()
+intents.members = True
+intents.presences = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+open_sessions = {}
+BOT_START_TIME = datetime.now(timezone.utc)
+
+
+for path, headers in [
+    (CSV_EVENTS, ["timestamp_iso_utc", "guild_id", "guild_name", "user_id", "username", "display_name", "before_status", "after_status"]),
+    (CSV_SESSIONS, ["guil³d_id", "guild_name", "user_id", "username", "display_name", "start_iso_utc", "end_iso_utc", "duration_seconds"])
+]:
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(headers)
+
+
+def write_event_csv(guild, member, before_status, after_status):
+    ts = datetime.now(timezone.utc).isoformat()
+    with open(CSV_EVENTS, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            ts, guild.id, guild.name, member.id, member.name, member.display_name, before_status, after_status
+        ])
+
+def write_session_csv(guild, member, start_dt, end_dt):
+    duration = (end_dt - start_dt).total_seconds()
+    with open(CSV_SESSIONS, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            guild.id, guild.name, member.id, member.name, member.display_name,
+            start_dt.isoformat(), end_dt.isoformat(), int(duration)
+        ])
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    if not interaction.guild:
+        return False
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member:
+        return False
+    return member.guild_permissions.manage_guild or any(r.name == ADMIN_ROLE_NAME for r in member.roles)
+
+
+@bot.event
+async def on_ready():
+    print(f"✅ Συνδέθηκε ως {bot.user} (id: {bot.user.id})")
+    for guild in bot.guilds:
+        print(f"🔸 Guild: {guild.name} ({guild.id}) — Μέλη: {len(guild.members)}")
+
+    try:
+        await bot.tree.sync()
+        print("✅ Slash commands synced.")
+    except Exception as e:
+        print("⚠️ Slash sync failed:", e)
+
+    if not retention_housekeeping.is_running():
+        retention_housekeeping.start()
+
+    await create_synthetic_sessions_on_start()
+
+
+@bot.event
+async def on_presence_update(before, after):
+    before_status, after_status = str(before.status), str(after.status)
+    if before_status == after_status:
+        return
+
+    guild = after.guild
+    write_event_csv(guild, after, before_status, after_status)
+    key = (guild.id, after.id)
+
+   
+    if after_status == "online" and key not in open_sessions:
+        open_sessions[key] = datetime.now(timezone.utc)
+    elif after_status in ("idle", "dnd"):
+        if key not in open_sessions:
+            open_sessions[key] = datetime.now(timezone.utc)
+    elif after_status == "offline":
+        start = open_sessions.pop(key, None)
+        end = datetime.now(timezone.utc)
+        if not start:
+            start = end
+        write_session_csv(guild, after, start, end)
+
+
+VOICE_EVENTS = "voice_events.csv"
+VOICE_SESSIONS = "voice_sessions.csv"
+
+
+CONSENTS_CSV = "consents.csv"
+
+
+if not os.path.exists(CONSENTS_CSV):
+    with open(CONSENTS_CSV, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(["timestamp_iso_utc", "guild_id", "guild_name", "user_id", "username", "display_name", "consent_text", "attachment"])
+
+
+def write_voice_session_csv(guild, member, channel, start_dt, end_dt, participants_start, participants_end, participants_list_start="", participants_list_end=""):
+    duration = (end_dt - start_dt).total_seconds()
+    with open(VOICE_SESSIONS, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            getattr(guild, "id", ""),
+            getattr(guild, "name", ""),
+            getattr(member, "id", ""),
+            getattr(member, "name", ""),
+            getattr(member, "display_name", ""),
+            getattr(channel, "id", "") if channel else "",
+            getattr(channel, "name", "") if channel else "",
+            start_dt.isoformat(),
+            end_dt.isoformat(),
+            int(duration),
+            participants_start,
+            participants_end,
+            participants_list_start,
+            participants_list_end
+        ])
+
+
+def participants_snapshot(channel):
+    if not channel:
+        return 0, ""
+    members = [m.name + ("#" + m.discriminator if getattr(m, "discriminator", None) else "") for m in channel.members]
+    return len(members), ";".join(members)  
+
+
+@bot.tree.command(name="consent", description="Καταγραφή συγκατάθεσης: /consent accept ή /consent revoke")
+@app_commands.describe(action="accept ή revoke", note="προαιρετική σημείωση/reference προς συμβόλαιο/αρχείο")
+async def consent(interaction: discord.Interaction, action: str, note: str = ""):
+    await interaction.response.defer(thinking=True)
+    if action.lower() not in ("accept", "revoke"):
+        await interaction.followup.send("Χρησιμοποίησε action = accept ή revoke.", ephemeral=True)
+        return
+    ts = datetime.now(timezone.utc).isoformat()
+    guild = interaction.guild
+    user = interaction.user
+    row = [ts, getattr(guild, "id", ""), getattr(guild, "name", ""), user.id, user.name, getattr(user, "display_name", ""), f"{action.lower()}", note]
+    with open(CONSENTS_CSV, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
+    await interaction.followup.send(f"✅ Καταγράφηκε: {action} ({note})", ephemeral=True)
+
+
+def build_html_voice_report(user_tag: str, sessions):
+    try:
+        from zoneinfo import ZoneInfo
+        ATHENS = ZoneInfo("Europe/Athens")
+    except Exception:
+        ATHENS = None
+
+    title = f"Voice report for {html.escape(user_tag)}"
+    buf = io.StringIO()
+    buf.write(f"<html><head><meta charset='utf-8'><title>{title}</title></head><body>")
+    buf.write(f"<h2>{title}</h2>")
+    total_secs = sum(s["duration"] for s in sessions)
+    buf.write(f"<p>Total sessions: {len(sessions)} — Total time: {str(timedelta(seconds=total_secs))}</p>")
+    buf.write("<table border='1' cellpadding='6'><tr><th>Date</th><th>Channel</th><th>Start (Greece)</th><th>End (Greece)</th><th>Duration</th><th>Participants at start</th><th>Participants list start</th><th>Participants at end</th><th>Participants list end</th></tr>")
+    for s in sessions:
+        start_local = s["start"].astimezone(ATHENS) if ATHENS else s["start"]
+        end_local = s["end"].astimezone(ATHENS) if ATHENS else s["end"]
+        plist_start = html.escape(s.get("participants_list_start",""))
+        plist_end = html.escape(s.get("participants_list_end",""))
+        buf.write(f"<tr><td>{start_local.date()}</td><td>{html.escape(s['channel_name'])}</td>"
+                  f"<td>{start_local.strftime('%Y-%m-%d %H:%M:%S')}</td>"
+                  f"<td>{end_local.strftime('%Y-%m-%d %H:%M:%S')}</td>"
+                  f"<td>{str(timedelta(seconds=s['duration']))}</td>"
+                  f"<td>{s.get('participants_start','')}</td><td>{plist_start}</td>"
+                  f"<td>{s.get('participants_end','')}</td><td>{plist_end}</td></tr>")
+    buf.write("</table></body></html>")
+    return buf.getvalue().encode("utf-8")
+
+
+
+for path, headers in [
+    (VOICE_EVENTS, ["timestamp_iso_utc", "guild_id", "guild_name", "user_id", "username", "display_name", "before_channel_id", "before_channel_name", "after_channel_id", "after_channel_name", "action"]),
+    (VOICE_SESSIONS, ["guild_id", "guild_name", "user_id", "username", "display_name", "channel_id", "channel_name", "start_iso_utc", "end_iso_utc", "duration_seconds", "participants_at_start", "participants_at_end"])
+]:
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(headers)
+
+
+open_voice_sessions = {}
+
+def write_voice_event_csv(guild, member, before_channel, after_channel, action):
+    ts = datetime.now(timezone.utc).isoformat()
+    with open(VOICE_EVENTS, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            ts,
+            getattr(guild, "id", ""),
+            getattr(guild, "name", ""),
+            getattr(member, "id", ""),
+            getattr(member, "name", ""),
+            getattr(member, "display_name", ""),
+            getattr(before_channel, "id", "") if before_channel else "",
+            getattr(before_channel, "name", "") if before_channel else "",
+            getattr(after_channel, "id", "") if after_channel else "",
+            getattr(after_channel, "name", "") if after_channel else "",
+            action
+        ])
+
+def write_voice_session_csv(guild, member, channel, start_dt, end_dt, participants_start, participants_end):
+    duration = (end_dt - start_dt).total_seconds()
+    with open(VOICE_SESSIONS, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            getattr(guild, "id", ""),
+            getattr(guild, "name", ""),
+            getattr(member, "id", ""),
+            getattr(member, "name", ""),
+            getattr(member, "display_name", ""),
+            getattr(channel, "id", "") if channel else "",
+            getattr(channel, "name", "") if channel else "",
+            start_dt.isoformat(),
+            end_dt.isoformat(),
+            int(duration),
+            participants_start,
+            participants_end
+        ])
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """
+    Called when user joins/leaves/moves voice channels.
+    before.channel / after.channel are discord.VoiceChannel or None.
+    """
+    guild = member.guild
+    before_ch = before.channel
+    after_ch = after.channel
+
+    
+    if before_ch is None and after_ch is not None:
+        action = "join"
+    elif before_ch is not None and after_ch is None:
+        action = "leave"
+    elif before_ch is not None and after_ch is not None and before_ch.id != after_ch.id:
+        action = "move"
+    else:
+        
+        return
+
+    
+    write_voice_event_csv(guild, member, before_ch, after_ch, action)
+
+    key = (guild.id if guild else None, member.id)
+
+    now = datetime.now(timezone.utc)
+
+    if action == "join":
+        
+        participants = len(after_ch.members) if after_ch else 0
+        open_voice_sessions[key] = {
+            "start": now,
+            "channel_id": after_ch.id if after_ch else None,
+            "channel_name": after_ch.name if after_ch else "",
+            "participants_at_start": participants
+        }
+    elif action == "move":
+        
+        prev = open_voice_sessions.pop(key, None)
+        participants_end = len(before_ch.members) if before_ch else 0
+        if prev:
+            start = prev.get("start", now)
+            
+            write_voice_session_csv(guild, member, before_ch, start, now, prev.get("participants_at_start", 0), participants_end)
+        
+        participants_after = len(after_ch.members) if after_ch else 0
+        open_voice_sessions[key] = {
+            "start": now,
+            "channel_id": after_ch.id if after_ch else None,
+            "channel_name": after_ch.name if after_ch else "",
+            "participants_at_start": participants_after
+        }
+    elif action == "leave":
+        prev = open_voice_sessions.pop(key, None)
+        participants_end = len(before_ch.members) if before_ch else 0  
+        end = now
+        if prev:
+            start = prev.get("start", end)
+            write_voice_session_csv(guild, member, before_ch, start, end, prev.get("participants_at_start", 0), participants_end)
+        else:
+            
+            write_voice_session_csv(guild, member, before_ch, end, end, participants_end, participants_end)
+
+
+def get_voice_sessions_for_user(username: str, guild_id: str = None, since_days: int = 3650):
+    results = []
+    if not os.path.exists(VOICE_SESSIONS):
+        return results
+    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    with open(VOICE_SESSIONS, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+           
+            if row.get("username", "").lower() != username.lower():
+                continue
+            if guild_id and row.get("guild_id", "") != str(guild_id):
+                continue
+            try:
+                start = datetime.fromisoformat(row.get("start_iso_utc", row.get("start_iso_utc","")))
+            except Exception:
+                start = None
+            try:
+                end = datetime.fromisoformat(row.get("end_iso_utc", row.get("end_iso_utc","")))
+            except Exception:
+                end = None
+            if not start or not end:
+                continue
+            if end >= cutoff:
+                results.append({
+                    "guild_name": row.get("guild_name",""),
+                    "channel_name": row.get("channel_name",""),
+                    "start": start,
+                    "end": end,
+                    "duration": int(row.get("duration_seconds",0)),
+                    "participants_start": row.get("participants_at_start",""),
+                    "participants_end": row.get("participants_at_end","")
+                })
+    
+    results.sort(key=lambda x: x["start"], reverse=True)
+    return results
+
+def build_html_voice_report(user_tag: str, sessions):
+    
+    try:
+        from zoneinfo import ZoneInfo
+        ATHENS = ZoneInfo("Europe/Athens")
+    except Exception:
+        ATHENS = None
+
+    title = f"Voice report for {html.escape(user_tag)}"
+    buf = io.StringIO()
+    buf.write(f"<html><head><meta charset='utf-8'><title>{title}</title></head><body>")
+    buf.write(f"<h2>{title}</h2>")
+    total_secs = sum(s["duration"] for s in sessions)
+    buf.write(f"<p>Total sessions: {len(sessions)} — Total time: {str(timedelta(seconds=total_secs))}</p>")
+    buf.write("<table border='1' cellpadding='6'><tr><th>Date</th><th>Channel</th><th>Start (Greece)</th><th>End (Greece)</th><th>Duration</th><th>Participants at start</th><th>Participants at end</th></tr>")
+    for s in sessions:
+        start_local = s["start"].astimezone(ATHENS) if ATHENS else s["start"]
+        end_local = s["end"].astimezone(ATHENS) if ATHENS else s["end"]
+        buf.write(f"<tr><td>{start_local.date()}</td><td>{html.escape(s['channel_name'])}</td>"
+                  f"<td>{start_local.strftime('%Y-%m-%d %H:%M:%S')}</td>"
+                  f"<td>{end_local.strftime('%Y-%m-%d %H:%M:%S')}</td>"
+                  f"<td>{str(timedelta(seconds=s['duration']))}</td>"
+                  f"<td>{s.get('participants_start','')}</td>"
+                  f"<td>{s.get('participants_end','')}</td></tr>")
+    buf.write("</table></body></html>")
+    return buf.getvalue().encode("utf-8")
+
+@bot.tree.command(name="voice_report", description="Voice sessions report for a username (username only, no #tag).")
+@app_commands.describe(username="username (no tag)", days="days to look back", guild_only="limit to this guild")
+async def voice_report(interaction: discord.Interaction, username: str, days: int = 30, guild_only: bool = True):
+    await interaction.response.defer(thinking=True)
+    if not is_admin(interaction):
+        await interaction.followup.send("❌ Δεν έχεις δικαίωμα.", ephemeral=True)
+        return
+    gid = str(interaction.guild.id) if (guild_only and interaction.guild) else None
+    sessions = get_voice_sessions_for_user(username, guild_id=gid, since_days=days)
+    if not sessions:
+        await interaction.followup.send(f"No voice sessions for `{username}` in last {days} days.", ephemeral=True)
+        return
+    html_bytes = build_html_voice_report(username, sessions)
+    fp = io.BytesIO(html_bytes)
+    await interaction.followup.send(file=discord.File(fp, filename=f"voice_report_{username}.html"), ephemeral=True)
+
+
+
+
+
+def get_sessions_for_user(username: str, guild_id: str = None, since_days: int = 30):
+    results = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    if not os.path.exists(CSV_SESSIONS):
+        return results
+    with open(CSV_SESSIONS, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row["username"] != username:
+                continue
+            if guild_id and row["guild_id"] != str(guild_id):
+                continue
+            try:
+                start = datetime.fromisoformat(row["start_iso_utc"])
+                end = datetime.fromisoformat(row["end_iso_utc"])
+            except Exception:
+                continue
+            if end >= cutoff:
+                results.append({
+                    "guild_name": row["guild_name"],
+                    "start": start,
+                    "end": end,
+                    "duration": int(row["duration_seconds"]),
+                })
+    return results
+
+def build_html_report(username: str, sessions):
+    gr_tz = ZoneInfo("Europe/Athens")  
+    buf = io.StringIO()
+    buf.write(f"<html><head><meta charset='utf-8'><title>Αναφορά παρουσίας για {html.escape(username)}</title></head><body>")
+    buf.write(f"<h2>Αναφορά παρουσίας για {html.escape(username)}</h2>")
+    total_secs = sum(s["duration"] for s in sessions)
+    buf.write(f"<p>Σύνολο συνεδριών: {len(sessions)} — Συνολικός χρόνος: {str(timedelta(seconds=total_secs))}</p>")
+    buf.write("<table border='1' cellpadding='6'><tr><th>Ημερομηνία</th><th>Έναρξη (Ώρα Ελλάδας)</th><th>Λήξη (Ώρα Ελλάδας)</th><th>Διάρκεια</th><th>Guild</th></tr>")
+    for s in sorted(sessions, key=lambda x: x["start"], reverse=True):
+        start_local = s['start'].astimezone(gr_tz)
+        end_local = s['end'].astimezone(gr_tz)
+        buf.write(f"<tr><td>{start_local.date()}</td><td>{start_local.strftime('%Y-%m-%d %H:%M')}</td>"
+                  f"<td>{end_local.strftime('%Y-%m-%d %H:%M')}</td>"
+                  f"<td>{str(timedelta(seconds=s['duration']))}</td>"
+                  f"<td>{html.escape(s['guild_name'])}</td></tr>")
+    buf.write("</table></body></html>")
+    return buf.getvalue().encode("utf-8")
+
+
+@bot.tree.command(name="presence_report", description="Βγάζει αναφορά παρουσιών (HTML) ενός χρήστη.")
+@app_commands.describe(username="Όνομα χρήστη (όχι tag)", days="Μέρες προς τα πίσω", guild_only="Μόνο σε αυτό τον server")
+async def presence_report(interaction: discord.Interaction, username: str, days: int = 30, guild_only: bool = True):
+    await interaction.response.defer(thinking=True)
+    if not is_admin(interaction):
+        await interaction.followup.send("❌ Δεν έχεις δικαίωμα να τρέξεις αυτή την εντολή.", ephemeral=True)
+        return
+
+    gid = str(interaction.guild.id) if (guild_only and interaction.guild) else None
+    sessions = get_sessions_for_user(username, guild_id=gid, since_days=days)
+    if not sessions:
+        await interaction.followup.send(f"Δεν βρέθηκαν δεδομένα για `{username}` τις τελευταίες {days} μέρες.", ephemeral=True)
+        return
+
+    html_bytes = build_html_report(username, sessions)
+    fp = io.BytesIO(html_bytes)
+    await interaction.followup.send(file=discord.File(fp, filename=f"presence_report_{username}.html"), ephemeral=True)
+
+@bot.tree.command(name="export_presence_csv", description="Εξάγει CSV (events ή sessions).")
+@app_commands.describe(which="events ή sessions")
+async def export_presence_csv(interaction: discord.Interaction, which: str = "sessions"):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Δεν έχεις δικαίωμα.", ephemeral=True)
+        return
+    path = CSV_EVENTS if which == "events" else CSV_SESSIONS
+    if not os.path.exists(path):
+        await interaction.response.send_message("Το CSV δεν υπάρχει ακόμα.", ephemeral=True)
+        return
+    await interaction.response.send_message("📎 Επισυνάπτω το CSV ιδιωτικά.", ephemeral=True)
+    await interaction.followup.send(file=discord.File(path), ephemeral=True)
+
+
+@tasks.loop(hours=24)
+async def retention_housekeeping():
+    if RETENTION_DAYS <= 0:
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    if not os.path.exists(CSV_SESSIONS):
+        return
+
+    kept = []
+    with open(CSV_SESSIONS, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            row = {k: v for k, v in row.items() if k in [
+                "guild_id", "guild_name", "user_id", "username",
+                "display_name", "start_iso_utc", "end_iso_utc", "duration_seconds"
+            ]}
+            try:
+                end = datetime.fromisoformat(row["end_iso_utc"])
+            except Exception:
+                continue
+            if end >= cutoff:
+                kept.append(row)
+
+    with open(CSV_SESSIONS, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "guild_id", "guild_name", "user_id", "username",
+            "display_name", "start_iso_utc", "end_iso_utc", "duration_seconds"
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(kept)
+
+    print("🧹 Retention cleanup completed successfully.")
+
+
+async def create_synthetic_sessions_on_start():
+    print("🔍 Checking online members at startup...")
+    for guild in bot.guilds:
+        for member in guild.members:
+            if str(member.status) != "online":
+                continue
+            key = (guild.id, member.id)
+            if key not in open_sessions:
+                open_sessions[key] = BOT_START_TIME
+                write_event_csv(guild, member, "offline", "online (synthetic_on_start)")
+                print(f"🟢 Synthetic session started for {member} in {guild}")
+
+
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
